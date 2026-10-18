@@ -368,23 +368,39 @@ export class MastraStorageExporter extends BaseExporter {
       return { failed: true };
     }
 
-    const partials: UpdateSpanPartial[] = [];
-    for (const event of events) {
-      const span = event.exportedSpan;
-      if (this.#eventBuffer.spanExists(span)) {
-        partials.push({
-          traceId: span.traceId,
-          spanId: span.id,
-          updates: buildUpdateSpanRecord(span),
-        });
-      } else {
-        deferredUpdates.push(event);
-      }
-    }
-
-    if (partials.length === 0) return FLUSH_SUCCEEDED;
-
     try {
+      const partials: UpdateSpanPartial[] = [];
+      for (const event of events) {
+        const span = event.exportedSpan;
+        let spanExists = this.#eventBuffer.spanExists(span);
+        if (!spanExists) {
+          // Rebuilt spans and previously flushed ends may already exist in storage.
+          try {
+            spanExists = !!(await this.#observabilityStorage!.getSpan({ traceId: span.traceId, spanId: span.id }));
+          } catch (error) {
+            // A write-only provider can still persist spans created by this exporter.
+            if (
+              !(error instanceof MastraError) ||
+              error.domain !== ErrorDomain.MASTRA_OBSERVABILITY ||
+              error.id !== 'OBSERVABILITY_STORAGE_GET_SPAN_NOT_IMPLEMENTED'
+            ) {
+              throw error;
+            }
+          }
+        }
+        if (spanExists) {
+          partials.push({
+            traceId: span.traceId,
+            spanId: span.id,
+            updates: buildUpdateSpanRecord(span),
+          });
+        } else {
+          deferredUpdates.push(event);
+        }
+      }
+
+      if (partials.length === 0) return FLUSH_SUCCEEDED;
+
       await this.#observabilityStorage!.batchUpdateSpans({ records: partials });
       if (isEnd) {
         this.#eventBuffer.endFinishedSpans({ records: partials });
@@ -433,8 +449,8 @@ export class MastraStorageExporter extends BaseExporter {
    * Flushes the current buffer to storage.
    *
    * Creates are flushed first, then their span keys are added to allCreatedSpans.
-   * Updates are checked against allCreatedSpans — those whose span hasn't been
-   * created yet are re-inserted into the live buffer for the next flush.
+   * Updates are checked against allCreatedSpans and, on a cache miss, storage.
+   * Those whose span has not been created are retried on the next flush.
    * Completed spans (SPAN_ENDED) are cleaned up from allCreatedSpans after success.
    */
   private async flushBuffer(): Promise<void> {

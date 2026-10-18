@@ -1,3 +1,4 @@
+import { Mastra } from '@mastra/core';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { SpanType, TracingEventType, EntityType } from '@mastra/core/observability';
 import type {
@@ -10,8 +11,10 @@ import type {
   ScoreEvent,
   FeedbackEvent,
 } from '@mastra/core/observability';
-import { serializeSpanAttributes } from '@mastra/core/storage';
+import { InMemoryStore, serializeSpanAttributes } from '@mastra/core/storage';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { Observability } from '../default';
+import { DefaultExporter } from './default';
 import { MastraStorageExporter } from './mastra-storage';
 
 // Mock Mastra and logger
@@ -162,6 +165,7 @@ describe('MastraStorageExporter', () => {
           preferred: 'batch-with-updates',
           supported: ['realtime', 'batch-with-updates', 'insert-only'],
         },
+        getSpan: vi.fn().mockResolvedValue(null),
         batchCreateSpans: vi.fn().mockResolvedValue(undefined),
         batchUpdateSpans: vi.fn().mockResolvedValue(undefined),
         createSpan: vi.fn().mockResolvedValue(undefined),
@@ -1789,5 +1793,158 @@ describe('MastraStorageExporter', () => {
         },
       };
     }
+  });
+});
+
+describe.each([
+  { name: 'MastraStorageExporter', Exporter: MastraStorageExporter },
+  { name: 'DefaultExporter', Exporter: DefaultExporter },
+])('$name persisted rebuilt spans', ({ Exporter }) => {
+  describe.each(['batch-with-updates', 'realtime'] as const)('%s', strategy => {
+    function open(storage: InMemoryStore, maxRetries = 0) {
+      const observability = new Observability({
+        configs: {
+          default: {
+            serviceName: 'rebuilt-span-storage',
+            exporters: [new Exporter({ strategy, maxRetries, maxBatchWaitMs: 60_000 })],
+          },
+        },
+      });
+      const mastra = new Mastra({ storage, observability, logger: false });
+      return { mastra, tracing: observability.getDefaultInstance()! };
+    }
+
+    it('persists a second end after the original span has already been flushed', async () => {
+      const storage = new InMemoryStore();
+      const { mastra, tracing } = open(storage);
+      try {
+        const span = tracing.startSpan({ type: SpanType.GENERIC, name: 'resumable operation' });
+        const snapshot = JSON.parse(JSON.stringify(span.exportSpan()));
+        span.end({ attributes: { revision: 1 } });
+        await tracing.flush();
+        const domain = (await storage.getStore('observability'))!;
+        const query = { traceId: span.traceId, spanId: span.id };
+        expect((await domain.getSpan(query))?.span.attributes).toMatchObject({ revision: 1 });
+
+        tracing.rebuildSpan(snapshot).end({ attributes: { revision: 2 } });
+        await tracing.flush();
+        expect((await domain.getSpan(query))?.span.attributes).toMatchObject({ revision: 2 });
+      } finally {
+        await mastra.shutdown();
+      }
+    });
+
+    it('persists updates and an end when a fresh exporter restores a stored span', async () => {
+      const storage = new InMemoryStore();
+      const first = open(storage);
+      const span = first.tracing.startSpan({ type: SpanType.GENERIC, name: 'operation before restart' });
+      const snapshot = JSON.parse(JSON.stringify(span.exportSpan()));
+      try {
+        span.end({ attributes: { revision: 1 } });
+        await first.tracing.flush();
+      } finally {
+        await first.mastra.shutdown();
+      }
+
+      const second = open(storage);
+      try {
+        const domain = (await storage.getStore('observability'))!;
+        const query = { traceId: span.traceId, spanId: span.id };
+        const rebuilt = second.tracing.rebuildSpan(snapshot);
+        rebuilt.update({ attributes: { revision: 2 } });
+        await second.tracing.flush();
+        expect((await domain.getSpan(query))?.span.attributes).toMatchObject({ revision: 2 });
+
+        rebuilt.end({ attributes: { revision: 3 } });
+        await second.tracing.flush();
+        expect((await domain.getSpan(query))?.span.attributes).toMatchObject({ revision: 3 });
+      } finally {
+        await second.mastra.shutdown();
+      }
+    });
+
+    it('does not create a row when a restored span has no persisted start', async () => {
+      const storage = new InMemoryStore();
+      const first = open(storage);
+      const span = first.tracing.startSpan({ type: SpanType.GENERIC, name: 'stored source span' });
+      const snapshot = JSON.parse(JSON.stringify(span.exportSpan()));
+      try {
+        span.end({ attributes: { revision: 1 } });
+        await first.tracing.flush();
+      } finally {
+        await first.mastra.shutdown();
+      }
+
+      const second = open(storage);
+      try {
+        const domain = (await storage.getStore('observability'))!;
+        const missing = { ...snapshot, id: 'f'.repeat(16) };
+        second.tracing.rebuildSpan(missing).end({ attributes: { revision: 2 } });
+        await second.tracing.flush();
+        expect(await domain.getSpan({ traceId: missing.traceId, spanId: missing.id })).toBeNull();
+        expect((await domain.getSpan({ traceId: span.traceId, spanId: span.id }))?.span.attributes).toMatchObject({
+          revision: 1,
+        });
+      } finally {
+        await second.mastra.shutdown();
+      }
+    });
+    it('keeps writing new spans when the provider does not implement getSpan', async () => {
+      const storage = new InMemoryStore();
+      const { mastra, tracing } = open(storage);
+      const domain = (await storage.getStore('observability'))!;
+      const getSpan = domain.getSpan.bind(domain);
+      const read = vi.spyOn(domain, 'getSpan').mockRejectedValue(
+        new MastraError({
+          id: 'OBSERVABILITY_STORAGE_GET_SPAN_NOT_IMPLEMENTED',
+          domain: ErrorDomain.MASTRA_OBSERVABILITY,
+          category: ErrorCategory.SYSTEM,
+          text: 'This storage provider does not support getting spans',
+        }),
+      );
+      try {
+        const original = tracing.startSpan({ type: SpanType.GENERIC, name: 'write-only source' });
+        const snapshot = JSON.parse(JSON.stringify(original.exportSpan()));
+        original.end();
+        await tracing.flush();
+        tracing.rebuildSpan(snapshot).end();
+        await tracing.flush();
+
+        const next = tracing.startSpan({ type: SpanType.GENERIC, name: 'write after unsupported read' });
+        next.end({ attributes: { revision: 1 } });
+        await tracing.flush();
+        expect((await getSpan({ traceId: next.traceId, spanId: next.id }))?.span.attributes).toMatchObject({
+          revision: 1,
+        });
+      } finally {
+        read.mockRestore();
+        await mastra.shutdown();
+      }
+    });
+    it('retries restored span updates after a transient storage read failure', async () => {
+      const storage = new InMemoryStore();
+      const { mastra, tracing } = open(storage, 1);
+      const domain = (await storage.getStore('observability'))!;
+      try {
+        const span = tracing.startSpan({ type: SpanType.GENERIC, name: 'retry stored span' });
+        const snapshot = JSON.parse(JSON.stringify(span.exportSpan()));
+        span.end({ attributes: { revision: 1 } });
+        await tracing.flush();
+
+        const read = vi.spyOn(domain, 'getSpan').mockRejectedValueOnce(new Error('Temporary storage read failure'));
+        try {
+          tracing.rebuildSpan(snapshot).end({ attributes: { revision: 2 } });
+          await tracing.flush();
+          await tracing.flush();
+          expect((await domain.getSpan({ traceId: span.traceId, spanId: span.id }))?.span.attributes).toMatchObject({
+            revision: 2,
+          });
+        } finally {
+          read.mockRestore();
+        }
+      } finally {
+        await mastra.shutdown();
+      }
+    });
   });
 });
